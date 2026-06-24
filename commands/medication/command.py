@@ -174,9 +174,20 @@ class MedicationCommand(IJarvisCommand):
             FieldSpec("dose", "string", label="Dose", placeholder="e.g. 1 pill, 75mg"),
             FieldSpec("dose_times", "array", item_type="time", label="Dose times"),
             FieldSpec("recurrence", "enum", enum_values=list(VALID_RECURRENCES), label="Repeat"),
-            # scope + owner are stamped server-side and must NOT be user-editable
-            # (changing them would re-scope who can see a personal med).
-            FieldSpec("scope", "enum", enum_values=list(VALID_SCOPES), label="Visible to", editable=False),
+            # scope is chosen ONCE at create time ("Visible to": Just me vs the
+            # household) and must NOT be editable afterwards — re-scoping would
+            # change who can see a personal med. create_only=True makes the add
+            # form offer it while the edit form leaves it read-only. The owner
+            # (user_id) is always stamped server-side from the authenticated
+            # caller, never sent by the client.
+            FieldSpec(
+                "scope",
+                "enum",
+                enum_values=list(VALID_SCOPES),
+                label="Visible to",
+                editable=False,
+                create_only=True,
+            ),
             FieldSpec("user_id", "user_ref", label="Owner", editable=False),
             FieldSpec("active", "bool", label="Active", editable=False),
             FieldSpec("created_at", "datetime", label="Added", editable=False),
@@ -193,6 +204,34 @@ class MedicationCommand(IJarvisCommand):
         if record.get("scope") == "household":
             bits.append("household")
         return RecordSummary(title=str(name), subtitle=" • ".join(bits) or None, icon="pill")
+
+    @property
+    def data_browser_supports_create(self) -> bool:
+        """Medications are added in the app — enable the create ("+") flow."""
+        return True
+
+    def data_browser_create(
+        self, fields: dict[str, Any], requesting_user_id: int | None
+    ) -> tuple[str, dict[str, Any]]:
+        """Create a medication from the app's add form.
+
+        Routes through ``MedicationStore.add_medication`` so the fail-closed
+        owner rule, dose-time normalization, scope→user_id stamping, and id
+        minting all apply. ``scope`` ("Visible to") is the create-only field
+        that decides ownership; the owner is always the authenticated caller
+        (``requesting_user_id``), never client-supplied. ``add_medication``
+        raises ``InvalidMedicationError`` (a ``ValueError``) on bad input,
+        which the node surfaces as a 400.
+        """
+        record = MedicationStore().add_medication(
+            name=fields.get("name", ""),
+            dose=fields.get("dose", ""),
+            dose_times=fields.get("dose_times") or [],
+            recurrence=fields.get("recurrence") or "daily",
+            scope=fields.get("scope") or "personal",
+            owner_user_id=requesting_user_id,
+        )
+        return record["id"], record
 
     # ── Examples ──────────────────────────────────────────────────────────
 
