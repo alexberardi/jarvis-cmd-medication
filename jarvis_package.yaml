@@ -1,0 +1,20 @@
+name: "medication_tracker"
+display_name: "Medication Tracker"
+description: "Track personal and household medications, get reminders when a dose is due, and mark doses administered. Medications are managed in the app; voice is for marking doses and quick queries."
+version: "0.1.0"
+min_jarvis_version: "0.1.115"
+# Node v0.1.115 / SDK 0.3.4 are the first releases with secret value_type "user"
+# (needed for MEDICATION_AGENT_USER) and per-user data scope enforcement.
+min_sdk_version: "0.3.4"
+license: "Apache-2.0"
+author:
+  github: "alexberardi"
+categories: ["health", "productivity"]
+platforms: ["darwin", "linux"]
+keywords: ["medication", "meds", "medicine", "pill", "dose", "prescription", "reminder"]
+
+packages: []
+
+# No secrets in v1: medication records carry their own owner (top-level user_id),
+# so the reminder agent watches all meds without a pinning secret.
+secrets: []
