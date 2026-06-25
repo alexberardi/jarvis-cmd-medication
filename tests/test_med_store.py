@@ -144,3 +144,23 @@ class TestDoseLog:
         store.log_dose(med, administered_by=ALICE, now=datetime(2026, 6, 23, 8, 0, tzinfo=timezone.utc))
         assert store.doses_on(med["id"], date(2026, 6, 24)) == []
         assert len(store.doses_on(med["id"], date(2026, 6, 23))) == 1
+
+    def test_evening_dose_lands_on_local_day(self, store):
+        # Regression: a dose taken just past midnight UTC (i.e. the prior
+        # evening in a negative-offset zone) must be found on its LOCAL day —
+        # doses_on normalises taken_at to local before taking the date, so this
+        # holds on any machine timezone, not just UTC.
+        med = _household(store, name="Evening")
+        instant = datetime(2026, 6, 25, 1, 30, tzinfo=timezone.utc)
+        store.log_dose(med, administered_by=ALICE, now=instant)
+        local_day = instant.astimezone().date()
+        assert len(store.doses_on(med["id"], local_day)) == 1
+
+    def test_default_timestamp_is_local_not_utc(self, store):
+        # Regression: log_dose with no explicit `now` must stamp local
+        # wall-clock (tz-aware), so the dose's calendar day matches the local
+        # day doses_on / the agent query — not tomorrow's UTC day in the evening.
+        from medication_shared.med_store import _iso
+
+        parsed = datetime.fromisoformat(_iso(None))
+        assert parsed.utcoffset() == datetime.now().astimezone().utcoffset()
