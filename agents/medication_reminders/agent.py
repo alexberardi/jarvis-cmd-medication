@@ -7,10 +7,12 @@ Polls every 5 minutes. For each active medication, per dose slot today
 - ``overdue`` — grace passed and still unmarked → an escalating warning, re-fired
                 at most hourly until the dose is marked or the next dose is due.
 
-Each fire is both spoken on the node (priority-3 ``Alert``) and pushed to the
-right audience (household med → everyone; personal med → the owner) with a
-"Mark administered" button. Marking the dose logs it, so the slot becomes
-``done`` and the warning stops — the dose log gates the whole state machine.
+Each fire is pushed to the right audience (household med → everyone; personal
+med → the owner) with a "Mark administered" button. Household meds are ALSO
+spoken on the node (priority-3 ``Alert``); personal meds are push-only and are
+never announced aloud — broadcasting someone's medication in a shared room is a
+privacy leak. Marking the dose logs it, so the slot becomes ``done`` and the
+warning stops — the dose log gates the whole state machine.
 
 The agent is a system actor (no ambient user), so it reads every active med via
 ``MedicationStore.all_active_medications()`` and routes each by its own
@@ -156,20 +158,25 @@ class MedicationReminderAgent(IJarvisAgent):
                 )
 
     def _fire(self, med: dict, dose_time: str, now: datetime, *, title: str, summary: str) -> None:
-        # Spoken on the node (priority 3 announces when the device is idle).
-        self._alerts.append(
-            Alert(
-                source_agent=self.name,
-                title=title,
-                summary=summary,
-                priority=3,
-                created_at=now,
-                expires_at=now + timedelta(minutes=ALERT_TTL_MINUTES),
-            )
-        )
-        # Push with a "Mark administered" button, scoped to the right audience.
         is_household = med.get("scope") == "household"
         owner = record_owner(med)
+        # Spoken on the node announces in a shared space — so it's only for
+        # HOUSEHOLD meds (shared, the household already knows). A PERSONAL med
+        # is push-only: the owner gets a private notification on their phone,
+        # but the node never broadcasts someone's medication aloud to the room
+        # (a health-privacy leak to anyone nearby).
+        if is_household:
+            self._alerts.append(
+                Alert(
+                    source_agent=self.name,
+                    title=title,
+                    summary=summary,
+                    priority=3,
+                    created_at=now,
+                    expires_at=now + timedelta(minutes=ALERT_TTL_MINUTES),
+                )
+            )
+        # Push with a "Mark administered" button, scoped to the right audience.
         element = {
             "id": f"mark-{med.get('id')}-{dose_time}",
             "label": "Mark administered",
