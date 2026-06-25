@@ -95,6 +95,39 @@ class TestScopingAndRecurrence:
         assert inbox.posts[0]["target_type"] == "user"
         assert inbox.posts[0]["user_id"] == ALICE
 
+
+class TestSpokenPrivacy:
+    """Household meds announce aloud; personal meds are push-only (never spoken
+    in a shared room — that would broadcast someone's private medication)."""
+
+    def test_household_announces_and_pushes(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        agent._tick(_now(8, 10))  # due
+        assert len(agent.get_alerts()) == 1  # spoken
+        assert len(inbox.posts) == 1  # push
+
+    def test_personal_pushes_but_does_not_announce(self, store, agent, inbox):
+        _personal(store, owner=ALICE, times=("08:00",))
+        agent._tick(_now(8, 10))  # due
+        assert agent.get_alerts() == []  # NOT spoken aloud
+        assert len(inbox.posts) == 1  # but still privately pushed to the owner
+
+    def test_personal_overdue_also_silent_aloud(self, store, agent, inbox):
+        _personal(store, owner=ALICE, times=("08:00",))
+        agent._tick(_now(8, 45))  # overdue (past 30-min grace)
+        assert agent.get_alerts() == []
+        assert len(inbox.posts) == 1
+        assert "overdue" in inbox.posts[0]["title"].lower()
+
+    def test_mixed_only_household_is_spoken(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        _personal(store, owner=ALICE, times=("08:00",))
+        agent._tick(_now(8, 10))
+        # one spoken (household), two pushes (both)
+        assert len(agent.get_alerts()) == 1
+        assert len(inbox.posts) == 2
+        assert agent.get_alerts()[0].title == "Time for Dog Med"
+
     def test_weekend_med_skips_a_weekday(self, store, agent, inbox):
         store.add_medication(
             name="Weekend Med", dose="1", dose_times=["08:00"], scope="household", recurrence="weekends",

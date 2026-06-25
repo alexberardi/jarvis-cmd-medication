@@ -186,3 +186,73 @@ class TestStatus:
         resp = cmd.run(_req(ALICE), action="status")
         assert resp.context_data["pending"] == []
         assert "caught up" in resp.context_data["message"].lower()
+
+
+class TestDataBrowserCreate:
+    """The app-add flow: cmd.data_browser_create routes through add_medication
+    so ownership/scope are stamped server-side and dose times normalized."""
+
+    def test_supports_create(self, cmd):
+        assert cmd.data_browser_supports_create is True
+
+    def test_scope_is_create_only(self, cmd):
+        scope = next(f for f in cmd.editable_fields() if f.name == "scope")
+        assert scope.create_only is True
+        assert scope.editable is False  # read-only on the edit form
+
+    def test_personal_create_stamps_caller_as_owner(self, store, cmd):
+        key, rec = cmd.data_browser_create(
+            {"name": "Vitamin D", "dose": "1 pill", "dose_times": ["08:00"], "scope": "personal"},
+            requesting_user_id=ALICE,
+        )
+        assert rec["id"] == key
+        assert rec["user_id"] == ALICE
+        assert rec["scope"] == "personal"
+        # persisted + visible to the owner, not to others
+        assert store.get_medication(key, ALICE) is not None
+        assert store.get_medication(key, BOB) is None
+
+    def test_household_create_has_no_owner(self, store, cmd):
+        key, rec = cmd.data_browser_create(
+            {"name": "Dog Rimadyl", "dose": "75mg", "dose_times": ["07:00", "19:00"], "scope": "household"},
+            requesting_user_id=ALICE,
+        )
+        assert rec["user_id"] is None
+        assert rec["scope"] == "household"
+        assert store.get_medication(key, BOB) is not None  # everyone sees it
+
+    def test_personal_without_known_user_is_fail_closed(self, store, cmd):
+        with pytest.raises(ValueError):
+            cmd.data_browser_create(
+                {"name": "Secret", "dose_times": ["08:00"], "scope": "personal"},
+                requesting_user_id=None,
+            )
+
+    def test_missing_scope_defaults_to_personal(self, store, cmd):
+        key, rec = cmd.data_browser_create(
+            {"name": "Vitamin", "dose_times": ["08:00"]}, requesting_user_id=ALICE
+        )
+        assert rec["scope"] == "personal"
+        assert rec["user_id"] == ALICE
+
+    def test_dose_times_string_is_coerced(self, store, cmd):
+        # the app's array-as-text edit path can arrive as a comma string
+        key, rec = cmd.data_browser_create(
+            {"name": "Vitamin", "dose_times": "20:00, 08:00", "scope": "personal"},
+            requesting_user_id=ALICE,
+        )
+        assert rec["dose_times"] == ["08:00", "20:00"]  # normalized + sorted
+
+    def test_bad_dose_time_rejected(self, store, cmd):
+        with pytest.raises(ValueError):
+            cmd.data_browser_create(
+                {"name": "Vitamin", "dose_times": ["25:99"], "scope": "personal"},
+                requesting_user_id=ALICE,
+            )
+
+    def test_empty_dose_times_rejected(self, store, cmd):
+        with pytest.raises(ValueError):
+            cmd.data_browser_create(
+                {"name": "Vitamin", "dose_times": [], "scope": "personal"},
+                requesting_user_id=ALICE,
+            )

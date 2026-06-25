@@ -18,7 +18,7 @@ unresolved speaker must never silently produce a household-visible "personal" me
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 from typing import Any
 
 from jarvis_command_sdk import JarvisStorage
@@ -78,7 +78,10 @@ def _normalized(record: dict) -> dict:
 
 
 def _iso(now: datetime | None) -> str:
-    return (now or datetime.now(timezone.utc)).isoformat()
+    # Local wall-clock (tz-aware) so a dose's calendar day matches how doses_on
+    # and the agent query it (both use the local date). Defaulting to UTC here
+    # mislabels evening doses with tomorrow's date once UTC rolls past midnight.
+    return (now or datetime.now().astimezone()).isoformat()
 
 
 def _clean_dose_times(dose_times: Any) -> list[str]:
@@ -227,6 +230,8 @@ class MedicationStore:
             if rec.get("med_id") != med_id:
                 continue
             taken_at = rec.get("taken_at")
-            if taken_at and datetime.fromisoformat(taken_at).date() == day:
+            # Normalise to local before taking the calendar day so a dose stored
+            # in any offset (incl. legacy UTC rows) lands on the right local day.
+            if taken_at and datetime.fromisoformat(taken_at).astimezone().date() == day:
                 out.append(rec)
         return out
