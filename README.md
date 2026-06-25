@@ -51,7 +51,7 @@ agents/medication_reminders/agent.py    # due-dose reminders + overdue warnings
 medication_shared/
   schedule_util.py                       # pure dose-schedule logic (states, due/overdue, recurrence)
   med_store.py                           # JarvisStorage-backed records + doses, visibility rules
-scripts/seed_dev_medications.py          # dev convenience: seed a few sample meds
+medication_scripts/seed_dev_medications.py  # dev convenience: seed a few sample meds
 tests/                                   # unit tests (pure logic + command + agent + store)
 ```
 
