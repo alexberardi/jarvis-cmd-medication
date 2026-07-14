@@ -1,7 +1,7 @@
 name: "medication_tracker"
 display_name: "Medication Tracker"
 description: "Track personal and household medications, get reminders when a dose is due, and mark doses administered. Medications are managed in the app; voice is for marking doses and quick queries."
-version: "0.2.0"
+version: "0.2.1"
 min_jarvis_version: "0.1.115"
 # SDK 0.4.1 adds the command-data create-verb (IJarvisCommand.data_browser_create
 # / data_browser_supports_create + FieldSpec.create_only) that the in-app "add
