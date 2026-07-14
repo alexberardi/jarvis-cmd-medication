@@ -138,22 +138,79 @@ def due_doses(
     ]
 
 
+def resolve_slot_for_mark(
+    dose_times: list[str],
+    now: datetime,
+    covered_slots: set[str] | None = None,
+    *,
+    early_minutes: int = 30,
+) -> str | None:
+    """Which dose slot is a mark *answering* right now? ``None`` if none is.
+
+    A mark may only cover a dose that has actually come due — the latest such
+    uncovered slot, so confirming at 20:10 marks the evening dose rather than
+    resurrecting an unmarked morning one. Taking a dose slightly early is normal,
+    so a slot is eligible from ``early_minutes`` before its scheduled time.
+
+    Crucially it must NEVER reach forward to a *future* dose. An earlier cut of
+    this function fell back to "the next upcoming slot" when nothing was due,
+    which meant a duplicate tap at 08:07 marked the 20:00 dose as taken — the very
+    silent-skip this change exists to remove, reintroduced from the other side.
+    When nothing is due and nothing is uncovered, the right answer is to record
+    nothing.
+    """
+    slot = due_slot(dose_times, now, early_minutes=early_minutes)
+    if slot is None:
+        return None
+    return None if slot in (covered_slots or set()) else slot
+
+
+def due_slot(
+    dose_times: list[str],
+    now: datetime,
+    *,
+    early_minutes: int = 30,
+) -> str | None:
+    """The dose slot that has come due as of ``now`` (latest one), ignoring
+    whether it's already been taken. ``None`` if no dose is due yet today.
+
+    Separate from ``resolve_slot_for_mark`` so callers can tell the difference
+    between a *duplicate* confirmation of a dose that's due, and a dose taken at
+    a time when nothing is scheduled — which is a real event that must still be
+    recorded, just not credited against a slot.
+    """
+    times = sorted({"%02d:%02d" % parse_hhmm(t) for t in coerce_dose_times(dose_times)})
+    window = timedelta(minutes=early_minutes)
+    eligible = [t for t in times if now >= _scheduled_on(now, t) - window]
+    return eligible[-1] if eligible else None
+
+
 def dose_states(
     dose_times: list[str],
     now: datetime,
     doses_taken_today: int,
     *,
+    covered_slots: set[str] | None = None,
     recurrence: str = "daily",
     grace_minutes: int = 30,
 ) -> list[tuple[str, str, datetime | None]]:
     """Per-slot state for today: ``(dose_time, state, scheduled_dt)``.
 
-    States: ``"done"`` (an earlier administration covers this slot),
-    ``"upcoming"`` (before its time), ``"due"`` (from its time through the
-    grace window), ``"overdue"`` (past the grace window, still unmarked).
+    States: ``"done"`` (an administration covers this slot), ``"upcoming"``
+    (before its time), ``"due"`` (from its time through the grace window),
+    ``"overdue"`` (past the grace window, still unmarked).
 
-    Administrations aren't slot-tagged, so the first ``doses_taken_today`` slots
-    (in time order) are treated as done — matching the "what's left today" query.
+    ``covered_slots`` is the set of slots actually administered today. Prefer it:
+    administrations used to be untagged, so this function counted rows and marked
+    the first N slots done, in time order. Two taps on the 08:00 dose therefore
+    marked the 20:00 dose "done" as well — no reminder, no error, nobody took it.
+    A count cannot distinguish "both doses taken" from "the morning one confirmed
+    twice".
+
+    ``doses_taken_today`` remains the fallback for legacy rows written before
+    slot-tagging (``covered_slots=None``), so existing installs keep their current
+    behaviour rather than resurrecting old doses as overdue.
+
     Returns ``[]`` on days the recurrence doesn't apply.
     """
     if not recurrence_applies(recurrence, now.date()):
@@ -162,7 +219,11 @@ def dose_states(
     grace = timedelta(minutes=grace_minutes)
     out: list[tuple[str, str, datetime | None]] = []
     for index, dose_time in enumerate(times):
-        if index < doses_taken_today:
+        if covered_slots is not None:
+            covered = dose_time in covered_slots
+        else:
+            covered = index < doses_taken_today  # legacy, untagged rows
+        if covered:
             out.append((dose_time, "done", None))
             continue
         hour, minute = parse_hhmm(dose_time)

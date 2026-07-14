@@ -332,8 +332,15 @@ class MedicationCommand(IJarvisCommand):
             if not recurrence_applies(med.get("recurrence", "daily"), now.date()):
                 continue
             scheduled = list(med.get("dose_times") or [])
-            taken = len(store.doses_on(med["id"], now.date()))
-            remaining = scheduled[taken:]
+            covered = store.covered_slots(med["id"], now.date())
+            if covered:
+                # Slot-tagged: what's left is what wasn't actually administered.
+                # (Slicing by a count marked the evening dose as taken whenever
+                # the morning one was confirmed twice.)
+                remaining = [t for t in scheduled if t not in covered]
+            else:
+                taken = len(store.doses_on(med["id"], now.date()))
+                remaining = scheduled[taken:]  # legacy untagged rows
             if remaining:
                 pending.append((med, remaining))
 
@@ -462,9 +469,14 @@ class MedicationCommand(IJarvisCommand):
         if not recurrence_applies(med.get("recurrence", "daily"), now.date()):
             return False
         med_id = med.get("id") or med.get("_data_key")
-        scheduled = len(coerce_dose_times(med.get("dose_times")))
-        taken = len(store.doses_on(med_id, now.date())) if med_id else 0
-        return taken < scheduled
+        if not med_id:
+            return True
+        slots = coerce_dose_times(med.get("dose_times"))
+        covered = store.covered_slots(med_id, now.date())
+        if covered:
+            return any(t not in covered for t in slots)
+        # Legacy untagged rows: fall back to counting.
+        return len(store.doses_on(med_id, now.date())) < len(slots)
 
     @callback("mark_administered")
     def mark_administered(self, data: dict, request_info: RequestInformation) -> CommandResponse:
@@ -498,7 +510,21 @@ class MedicationCommand(IJarvisCommand):
 
         Returns True if a household broadcast was posted successfully.
         """
-        store.log_dose(med, administered_by=administered_by, source=source, now=now)
+        recorded = store.log_dose(
+            med, administered_by=administered_by, source=source, now=now
+        )
+        if recorded is None:
+            # Every slot for today is already covered — this is a duplicate
+            # confirmation (double-tap, or a tap plus a spoken "I took it").
+            # Don't log it and don't broadcast: a second "administered" push is
+            # how a household member gets told twice, and the extra row is what
+            # used to silently mark the next dose as taken.
+            _logger.info(
+                "medication mark ignored (dose already recorded today)",
+                med=med.get("name"),
+                source=source,
+            )
+            return False
         if med.get("scope") != "household":
             _logger.info("medication marked (personal — no broadcast)", med=med.get("name"), source=source)
             return False

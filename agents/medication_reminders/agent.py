@@ -126,11 +126,18 @@ class MedicationReminderAgent(IJarvisAgent):
         if not med_id:
             return
         name = med.get("name") or "your medication"
+        # Pass the slots ACTUALLY administered, not a count. Counting made a
+        # second confirmation of the morning dose mark the evening one "done" —
+        # so the evening reminder silently never fired. covered_slots is empty for
+        # legacy untagged rows, which is why the count is still passed as the
+        # fallback.
         taken_today = len(store.doses_on(med_id, now.date()))
+        covered = store.covered_slots(med_id, now.date()) or None
         states = dose_states(
             med.get("dose_times") or [],
             now,
             taken_today,
+            covered_slots=covered,
             recurrence=med.get("recurrence", "daily"),
             grace_minutes=GRACE_MINUTES,
         )

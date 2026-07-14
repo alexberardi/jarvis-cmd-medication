@@ -28,6 +28,8 @@ from medication_shared.schedule_util import (
     InvalidScheduleError,
     coerce_dose_times,
     parse_hhmm,
+    due_slot,
+    resolve_slot_for_mark,
 )
 
 MEDS_STORAGE = "medication"
@@ -206,9 +208,34 @@ class MedicationStore:
         administered_by: int | None,
         source: str = "voice",
         now: datetime | None = None,
-    ) -> dict:
-        """Record that a dose of ``med`` was administered. Mirrors the med's
-        ``user_id`` onto the log row so the browser filter treats it identically."""
+    ) -> dict | None:
+        """Record that a dose of ``med`` was administered, tagged with the slot it
+        covers. Mirrors the med's ``user_id`` onto the log row so the browser
+        filter treats it identically.
+
+        Returns ``None`` when that slot is ALREADY covered today — i.e. this is a
+        duplicate confirmation (a double-tap, or a tap plus a voice "I took it").
+
+        The guard is load-bearing. Administrations used to be untagged and merely
+        counted, so a second mark of the morning dose pushed the count to 2 and
+        the evening slot was rendered "done" — silently, with no reminder and no
+        error. Duplicate marks are not hypothetical: two "administered" pushes
+        2.5 minutes apart were observed in production, and a double-tap whose
+        second confirmation was swallowed by the notification dedup window.
+        """
+        stamp = (now or datetime.now()).astimezone()
+        times = coerce_dose_times(med.get("dose_times"))
+        covered = self.covered_slots(med["id"], stamp.date())
+
+        slot = due_slot(times, stamp)
+        if slot is not None and slot in covered:
+            # A dose IS due, and it's already been marked — this is a duplicate
+            # confirmation (double-tap, or a tap plus a spoken "I took it").
+            return None
+        # slot is None => nothing is scheduled around now. That's still a real
+        # administration and must be recorded, but it credits no slot: silently
+        # dropping it would be the same class of bug from the other direction.
+
         taken_at = _iso(now)
         key = f"dose-{med['id']}-{taken_at}"
         record = {
@@ -216,12 +243,26 @@ class MedicationStore:
             "med_name": med.get("name"),
             "administered_by": None if administered_by is None else int(administered_by),
             "taken_at": taken_at,
+            "dose_time": slot,
             "source": source,
             "scope": med.get("scope"),
             "user_id": med.get("user_id"),
         }
         self._doses.save(key, record)
         return record
+
+    def covered_slots(self, med_id: str, day: date) -> set[str]:
+        """Dose slots actually administered on ``day``.
+
+        Only slot-tagged rows count. Legacy rows (written before tagging) have no
+        ``dose_time``; callers fall back to counting for those so existing installs
+        don't suddenly resurrect old doses as overdue.
+        """
+        return {
+            rec["dose_time"]
+            for rec in self.doses_on(med_id, day)
+            if rec.get("dose_time")
+        }
 
     def doses_on(self, med_id: str, day: date) -> list[dict]:
         """All administration records for ``med_id`` on ``day`` (local to taken_at)."""
