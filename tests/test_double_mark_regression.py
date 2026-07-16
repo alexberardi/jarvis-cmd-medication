@@ -22,9 +22,17 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from medication_shared.med_store import MedicationStore
-from medication_shared.schedule_util import dose_states
+from medication_shared.schedule_util import dose_states, slot_coverage
 
 TZ = timezone.utc
+
+
+def tagged(*slots: str) -> list[dict]:
+    return [{"dose_time": s} for s in slots]
+
+
+def untagged(n: int = 1) -> list[dict]:
+    return [{"dose_time": None} for _ in range(n)]
 
 
 @pytest.fixture
@@ -46,22 +54,20 @@ class TestDoubleMarkDoesNotConsumeLaterDose:
         states = dose_states(
             self.TIMES,
             now=_at(20, 30),
-            doses_taken_today=1,
-            covered_slots={"08:00"},
+            covered=slot_coverage(self.TIMES, tagged("08:00")),
         )
         by_slot = {slot: state for slot, state, _ in states}
         assert by_slot["08:00"] == "done"
         assert by_slot["20:00"] == "overdue", "evening dose was never taken"
 
     def test_double_marking_the_morning_does_not_mark_the_evening(self):
-        # The bug: two taps on 08:00 → count == 2 → both slots "done".
-        # Slot-tagged, the evening dose is still owed regardless of how many
-        # times the morning one was confirmed.
+        # The bug: two rows for 08:00 → count == 2 → both slots "done".
+        # Slot-tagged, duplicate tags for one slot are inert: the evening dose
+        # is still owed regardless of how many times the morning was confirmed.
         states = dose_states(
             self.TIMES,
             now=_at(20, 30),
-            doses_taken_today=2,          # two log rows, both for the morning
-            covered_slots={"08:00"},      # ...but only one slot is actually covered
+            covered=slot_coverage(self.TIMES, tagged("08:00", "08:00")),
         )
         by_slot = {slot: state for slot, state, _ in states}
         assert by_slot["08:00"] == "done"
@@ -73,8 +79,7 @@ class TestDoubleMarkDoesNotConsumeLaterDose:
         states = dose_states(
             self.TIMES,
             now=_at(21, 0),
-            doses_taken_today=2,
-            covered_slots={"08:00", "20:00"},
+            covered=slot_coverage(self.TIMES, tagged("08:00", "20:00")),
         )
         assert all(state == "done" for _, state, _ in states)
 
@@ -85,8 +90,7 @@ class TestDoubleMarkDoesNotConsumeLaterDose:
         states = dose_states(
             self.TIMES,
             now=_at(20, 30),
-            doses_taken_today=1,
-            covered_slots=None,  # no slot information available
+            covered=slot_coverage(self.TIMES, untagged(1)),
         )
         by_slot = {slot: state for slot, state, _ in states}
         assert by_slot["08:00"] == "done"

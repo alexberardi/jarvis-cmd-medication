@@ -25,9 +25,15 @@ __all__ = [
     "VALID_RECURRENCES",
     "InvalidScheduleError",
     "parse_hhmm",
+    "canon_slot",
+    "canon_slots",
     "recurrence_applies",
     "is_dose_due",
     "due_doses",
+    "eligible_slots",
+    "due_slot",
+    "resolve_slot_for_mark",
+    "slot_coverage",
     "next_due",
     "dose_states",
     "coerce_dose_times",
@@ -37,6 +43,15 @@ VALID_RECURRENCES = ("daily", "weekdays", "weekends")
 
 # How far ahead next_due will search before giving up (covers any weekly gap).
 _HORIZON_DAYS = 8
+
+# A dose may be marked this many minutes before its scheduled time.
+EARLY_MINUTES = 30
+
+# An orphan-tagged row (its slot was edited off the schedule) may credit an
+# uncovered slot at most this far from its tag. Close enough to heal a slot
+# *rename* (07:00 → 07:30), far enough that a *removed* slot's already-consumed
+# administration can't leak onto tonight's dose.
+ORPHAN_CREDIT_WINDOW_MINUTES = 120
 
 
 class InvalidScheduleError(ValueError):
@@ -77,6 +92,33 @@ def parse_hhmm(value: str) -> tuple[int, int]:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         raise InvalidScheduleError(f"dose time out of range, got {value!r}")
     return hour, minute
+
+
+def canon_slot(value: Any) -> str | None:
+    """Canonical slot identity: ``"7:00"`` → ``"07:00"``; ``None`` if unparseable.
+
+    Slot values reach comparisons from three independently-produced sources —
+    the stored schedule (the app's array-as-text edit persists unpadded times
+    like ``"7:00"``), row tags written by this module (always padded), and push
+    button payloads. Every membership test in this module goes through this
+    canonical form; comparing raw strings makes tagged rows invisible the moment
+    a schedule is edited by hand.
+    """
+    try:
+        return "%02d:%02d" % parse_hhmm(str(value))
+    except InvalidScheduleError:
+        return None
+
+
+def canon_slots(dose_times: Any) -> list[str]:
+    """The schedule as canonical slots, chronological, deduped.
+
+    Chronological, not lexical: sorted raw, ``"7:00"`` lands *after* ``"19:00"``
+    and every earliest-first walk below would run backwards.
+    """
+    out = {canon_slot(t) for t in coerce_dose_times(dose_times)}
+    out.discard(None)
+    return sorted(out)  # type: ignore[arg-type]  # None discarded above
 
 
 def recurrence_applies(recurrence: str, day: date) -> bool:
@@ -138,59 +180,137 @@ def due_doses(
     ]
 
 
-def resolve_slot_for_mark(
+def eligible_slots(
     dose_times: list[str],
     now: datetime,
-    covered_slots: set[str] | None = None,
     *,
-    early_minutes: int = 30,
-) -> str | None:
-    """Which dose slot is a mark *answering* right now? ``None`` if none is.
+    early_minutes: int = EARLY_MINUTES,
+) -> list[str]:
+    """Canonical slots whose mark window has opened by ``now``, chronological.
 
-    A mark may only cover a dose that has actually come due — the latest such
-    uncovered slot, so confirming at 20:10 marks the evening dose rather than
-    resurrecting an unmarked morning one. Taking a dose slightly early is normal,
-    so a slot is eligible from ``early_minutes`` before its scheduled time.
-
-    Crucially it must NEVER reach forward to a *future* dose. An earlier cut of
-    this function fell back to "the next upcoming slot" when nothing was due,
-    which meant a duplicate tap at 08:07 marked the 20:00 dose as taken — the very
-    silent-skip this change exists to remove, reintroduced from the other side.
-    When nothing is due and nothing is uncovered, the right answer is to record
-    nothing.
+    A slot is markable from ``early_minutes`` before its scheduled time (taking
+    a dose slightly early is normal) through the end of the day. Eligibility is
+    monotone within a day: once a slot's window opens it never closes.
     """
-    slot = due_slot(dose_times, now, early_minutes=early_minutes)
-    if slot is None:
-        return None
-    return None if slot in (covered_slots or set()) else slot
+    window = timedelta(minutes=early_minutes)
+    return [t for t in canon_slots(dose_times) if now >= _scheduled_on(now, t) - window]
 
 
 def due_slot(
     dose_times: list[str],
     now: datetime,
     *,
-    early_minutes: int = 30,
+    early_minutes: int = EARLY_MINUTES,
 ) -> str | None:
-    """The dose slot that has come due as of ``now`` (latest one), ignoring
-    whether it's already been taken. ``None`` if no dose is due yet today.
+    """The latest slot whose window has opened as of ``now``, ignoring coverage.
+    ``None`` if no dose is markable yet today.
 
-    Separate from ``resolve_slot_for_mark`` so callers can tell the difference
-    between a *duplicate* confirmation of a dose that's due, and a dose taken at
-    a time when nothing is scheduled — which is a real event that must still be
-    recorded, just not credited against a slot.
+    Callers use the None/not-None distinction to tell "nothing is scheduled
+    around now" (a mark records an untagged, real administration) from "a dose
+    is in play" (a mark either covers a slot or is a duplicate).
     """
-    times = sorted({"%02d:%02d" % parse_hhmm(t) for t in coerce_dose_times(dose_times)})
-    window = timedelta(minutes=early_minutes)
-    eligible = [t for t in times if now >= _scheduled_on(now, t) - window]
+    eligible = eligible_slots(dose_times, now, early_minutes=early_minutes)
     return eligible[-1] if eligible else None
+
+
+def resolve_slot_for_mark(
+    dose_times: list[str],
+    now: datetime,
+    covered_slots: set[str] | None = None,
+    *,
+    early_minutes: int = EARLY_MINUTES,
+) -> str | None:
+    """Which dose slot is a mark *answering* right now? ``None`` if none is.
+
+    The latest slot whose window has opened and that is not yet covered —
+    confirming at 20:10 marks the evening dose rather than resurrecting an
+    unmarked morning one, but when the evening dose is already covered a mark
+    falls back to the still-open earlier slot instead of being swallowed.
+
+    That fallback is load-bearing: v0.2.1 keyed its duplicate guard on the
+    latest open slot regardless of coverage, so once the evening dose was
+    marked, the system could keep alerting for the morning slot while refusing
+    every mark that would have covered it (the 2026-07-15 lockout). Alerts and
+    marks must agree on what is owed.
+
+    A slot whose window hasn't opened is never returned: a mark can't reach
+    forward past ``early_minutes`` to a future dose.
+    """
+    covered = covered_slots or set()
+    uncovered = [
+        t
+        for t in eligible_slots(dose_times, now, early_minutes=early_minutes)
+        if t not in covered
+    ]
+    return uncovered[-1] if uncovered else None
+
+
+def slot_coverage(dose_times: list[str], rows: list[dict]) -> set[str]:
+    """Map one day's administration rows onto the slots they cover.
+
+    THE single source of truth for "which doses are done today": the reminder
+    agent, the status query, the pending-dose check, and ``log_dose``'s
+    duplicate guard must all derive coverage from here. The 2026-07-15 incident
+    was two views of coverage disagreeing — the agent demanding a slot that the
+    mark path structurally refused to accept a mark for.
+
+    Three kinds of row, in decreasing specificity:
+
+    - **Tagged** (``dose_time`` is a current slot): covers exactly that slot.
+      Duplicate tags for one slot are inert — they never spill onto another.
+    - **Orphan-tagged** (``dose_time`` parses but was edited off the schedule):
+      credits the nearest uncovered slot within ``ORPHAN_CREDIT_WINDOW_MINUTES``
+      — heals a slot rename without letting a *removed* slot's consumed dose
+      leak onto tonight's. No slot in range → the row records history, covers
+      nothing. An unparseable tag is treated the same as no slot in range.
+    - **Untagged** (no ``dose_time``: pre-slot-tagging legacy rows, or a mark
+      before the day's first window): each credits the earliest uncovered slot.
+      For an all-untagged day this reproduces the pre-tagging counting exactly,
+      so existing installs keep their behaviour.
+    """
+    slots = canon_slots(dose_times)
+    covered: set[str] = set()
+    orphans: list[str] = []
+    credits = 0
+    for rec in rows:
+        raw = rec.get("dose_time")
+        if not raw:
+            credits += 1
+            continue
+        tag = canon_slot(raw)
+        if tag in slots:
+            covered.add(tag)  # type: ignore[arg-type]
+        elif tag is not None:
+            orphans.append(tag)
+    for tag in sorted(orphans):
+        tag_min = _minutes(tag)
+        in_range = [
+            t
+            for t in slots
+            if t not in covered
+            and abs(_minutes(t) - tag_min) <= ORPHAN_CREDIT_WINDOW_MINUTES
+        ]
+        if in_range:
+            covered.add(min(in_range, key=lambda t: (abs(_minutes(t) - tag_min), t)))
+    for t in slots:
+        if credits <= 0:
+            break
+        if t not in covered:
+            covered.add(t)
+            credits -= 1
+    return covered
+
+
+def _minutes(slot: str) -> int:
+    hour, minute = parse_hhmm(slot)
+    return hour * 60 + minute
 
 
 def dose_states(
     dose_times: list[str],
     now: datetime,
-    doses_taken_today: int,
+    covered: set[str],
     *,
-    covered_slots: set[str] | None = None,
     recurrence: str = "daily",
     grace_minutes: int = 30,
 ) -> list[tuple[str, str, datetime | None]]:
@@ -200,34 +320,24 @@ def dose_states(
     (before its time), ``"due"`` (from its time through the grace window),
     ``"overdue"`` (past the grace window, still unmarked).
 
-    ``covered_slots`` is the set of slots actually administered today. Prefer it:
-    administrations used to be untagged, so this function counted rows and marked
-    the first N slots done, in time order. Two taps on the 08:00 dose therefore
-    marked the 20:00 dose "done" as well — no reminder, no error, nobody took it.
-    A count cannot distinguish "both doses taken" from "the morning one confirmed
-    twice".
-
-    ``doses_taken_today`` remains the fallback for legacy rows written before
-    slot-tagging (``covered_slots=None``), so existing installs keep their current
-    behaviour rather than resurrecting old doses as overdue.
+    ``covered`` MUST come from :func:`slot_coverage` over the day's rows. There
+    is deliberately no count parameter and no fallback: v0.2.1 kept a legacy
+    count fallback that engaged only when *zero* rows were slot-tagged, so the
+    day's first tagged row retroactively flipped every untagged row's slot to
+    "overdue" (the 2026-07-15 incident). Untagged-row handling lives in
+    ``slot_coverage``, in one place.
 
     Returns ``[]`` on days the recurrence doesn't apply.
     """
     if not recurrence_applies(recurrence, now.date()):
         return []
-    times = sorted({"%02d:%02d" % parse_hhmm(t) for t in coerce_dose_times(dose_times)})
     grace = timedelta(minutes=grace_minutes)
     out: list[tuple[str, str, datetime | None]] = []
-    for index, dose_time in enumerate(times):
-        if covered_slots is not None:
-            covered = dose_time in covered_slots
-        else:
-            covered = index < doses_taken_today  # legacy, untagged rows
-        if covered:
+    for dose_time in canon_slots(dose_times):
+        if dose_time in covered:
             out.append((dose_time, "done", None))
             continue
-        hour, minute = parse_hhmm(dose_time)
-        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        scheduled = _scheduled_on(now, dose_time)
         if now < scheduled:
             state = "upcoming"
         elif now < scheduled + grace:
