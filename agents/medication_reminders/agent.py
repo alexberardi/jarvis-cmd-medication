@@ -56,7 +56,7 @@ from jarvis_command_sdk import (
 )
 
 from medication_shared.med_store import MedicationStore, record_owner
-from medication_shared.schedule_util import dose_states
+from medication_shared.schedule_util import canon_slot, coerce_dose_times, dose_states
 
 logger = JarvisLogger(service="jarvis-node")
 
@@ -126,6 +126,14 @@ class MedicationReminderAgent(IJarvisAgent):
         if not med_id:
             return
         name = med.get("name") or "your medication"
+        bad = [t for t in coerce_dose_times(med.get("dose_times")) if canon_slot(t) is None]
+        if bad:
+            # An unparseable schedule entry silently produces NO reminders for
+            # that time — surface it in the logs instead of hiding the med.
+            logger.warning(
+                "medication has unreadable dose times — no reminders will fire for them",
+                med=name, unreadable=bad,
+            )
         # slot_coverage is the SAME function log_dose's duplicate guard resolves
         # against. The agent and the mark path disagreeing on what is owed is
         # the 2026-07-15 incident: this agent demanded the 07:00 slot all

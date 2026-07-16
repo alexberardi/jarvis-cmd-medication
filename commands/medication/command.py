@@ -36,9 +36,11 @@ from jarvis_command_sdk import (
 from medication_shared.med_store import VALID_SCOPES, MedicationStore, record_owner
 from medication_shared.schedule_util import (
     VALID_RECURRENCES,
+    canon_slot,
     canon_slots,
     coerce_dose_times,
-    next_due,
+    dose_states,
+    eligible_slots,
     recurrence_applies,
 )
 
@@ -330,7 +332,13 @@ class MedicationCommand(IJarvisCommand):
             )
 
         pending: list[tuple[dict, list[str]]] = []
+        unreadable: list[str] = []
         for med in meds:
+            bad = [t for t in coerce_dose_times(med.get("dose_times")) if canon_slot(t) is None]
+            if bad:
+                # A hand-edited schedule entry that won't parse would otherwise
+                # vanish silently: no reminders, and status says "caught up".
+                unreadable.append(f"{med['name']} ({', '.join(bad)})")
             if not recurrence_applies(med.get("recurrence", "daily"), now.date()):
                 continue
             covered = store.coverage_for(med, now.date())
@@ -338,10 +346,17 @@ class MedicationCommand(IJarvisCommand):
             if remaining:
                 pending.append((med, remaining))
 
+        warning = (
+            " Heads up: I can't read some dose times — "
+            + "; ".join(unreadable)
+            + " — fix them in the app."
+            if unreadable
+            else ""
+        )
         if not pending:
             return CommandResponse.success_response(
                 context_data={
-                    "message": "You're all caught up on your medications for today.",
+                    "message": "You're all caught up on your medications for today." + warning,
                     "pending": [],
                 },
                 wait_for_input=False,
@@ -350,7 +365,7 @@ class MedicationCommand(IJarvisCommand):
         parts = [f"{med['name']} ({', '.join(rem)})" for med, rem in pending]
         return CommandResponse.success_response(
             context_data={
-                "message": "Still to take today: " + "; ".join(parts) + ".",
+                "message": "Still to take today: " + "; ".join(parts) + "." + warning,
                 "pending": [
                     {"id": med["id"], "name": med["name"], "remaining": rem}
                     for med, rem in pending
@@ -410,16 +425,39 @@ class MedicationCommand(IJarvisCommand):
         if recorded is None:
             msg = self._already_recorded_message(store, med)
         elif med.get("scope") == "household" and broadcast:
-            msg = f"Marked {med['name']} as given, and let the household know."
+            msg = f"Marked {med['name']} as given{self._credited_suffix(med, recorded)}, and let the household know."
         else:
-            msg = f"Marked {med['name']} as taken."
+            msg = f"Marked {med['name']} as taken{self._credited_suffix(med, recorded)}."
         return CommandResponse.success_response(
             context_data={
                 "message": msg, "med_id": med["id"], "name": med["name"],
                 "recorded": recorded is not None,
+                "dose_time": (recorded or {}).get("dose_time"),
             },
             wait_for_input=False,
         )
+
+    def _credited_suffix(
+        self, med: dict, recorded: dict | None, now: datetime | None = None
+    ) -> str:
+        """Name the slot a mark credited when it isn't the obvious one.
+
+        Repeated marks deliberately cascade backward through open earlier slots
+        (an alerting slot must always be healable), but three identical
+        "Marked as taken" replies crediting 8 PM, then 2 PM, then 8 AM give the
+        user no signal that echoes just marked two missed doses as given.
+        """
+        slot = (recorded or {}).get("dose_time")
+        if not slot:
+            return ""
+        now = (now or datetime.now()).astimezone()
+        latest_open = eligible_slots(med.get("dose_times") or [], now)
+        if latest_open and slot != latest_open[-1]:
+            scheduled = now.replace(
+                hour=int(slot[:2]), minute=int(slot[3:]), second=0, microsecond=0
+            )
+            return f" — counted for the {_spoken_time(scheduled)} dose that was still open"
+        return ""
 
     def _already_recorded_message(
         self, store: MedicationStore, med: dict, now: datetime | None = None
@@ -430,20 +468,29 @@ class MedicationCommand(IJarvisCommand):
         is how the 2026-07-15 lockout stayed invisible — the user re-marked for
         two hours while nothing was being written. Saying "already marked" is
         also the right safety answer if this was a genuine second administration.
+
+        The hint is coverage-aware. Naming a covered slot as "the next dose"
+        invites a double administration; naming a still-open one (reachable via
+        a duplicate button tap while another slot is owed) flags exactly what
+        the system is still waiting on.
         """
         now = (now or datetime.now()).astimezone()
         name = med.get("name") or "that medication"
         slots = canon_slots(med.get("dose_times"))
         covered = store.coverage_for(med, now.date())
+        base = f"{name} is already marked for now — nothing new recorded."
+        states = dose_states(
+            slots, now, covered, recurrence=med.get("recurrence", "daily")
+        )
+        still_open = [sched for _, s, sched in states if s in ("due", "overdue") and sched]
+        if still_open:
+            return base + f" The {_spoken_time(still_open[0])} dose still isn't marked, though."
+        upcoming = [sched for _, s, sched in states if s == "upcoming" and sched]
+        if upcoming:
+            return base + f" The next dose is at {_spoken_time(upcoming[0])}."
         if slots and all(t in covered for t in slots):
             return f"{name} is already marked as done for today."
-        nxt = next_due(slots, now, recurrence=med.get("recurrence", "daily"))
-        if nxt is not None:
-            return (
-                f"{name} is already marked for now — nothing new recorded. "
-                f"The next dose is at {_spoken_time(nxt)}."
-            )
-        return f"{name} is already marked for now — nothing new recorded."
+        return base
 
     def _run_mark_mine(
         self, store: MedicationStore, viewer: int | None, now: datetime | None = None
@@ -471,10 +518,18 @@ class MedicationCommand(IJarvisCommand):
             )
         pending = [m for m in mine if self._has_pending_dose(store, m, now)]
         if not pending:
-            if any(canon_slots(m.get("dose_times")) for m in mine):
+            scheduled_today = any(
+                recurrence_applies(m.get("recurrence", "daily"), now.date())
+                and canon_slots(m.get("dose_times"))
+                for m in mine
+            )
+            if scheduled_today:
                 msg = "You've already taken all your medications for today."
             else:
-                msg = "None of your medications have doses scheduled today."
+                msg = (
+                    "None of your medications have doses scheduled today — "
+                    "if you did take one, name it and I'll record it."
+                )
             return CommandResponse.success_response(
                 context_data={"message": msg, "marked": []}, wait_for_input=False
             )
@@ -484,15 +539,21 @@ class MedicationCommand(IJarvisCommand):
         # for them is the false-success bug this fix removes.
         marked: list[str] = []
         already: list[str] = []
+        last_recorded: dict | None = None
+        last_recorded_med: dict | None = None
         for med in pending:
             recorded, _ = self._record_and_broadcast(store, med, viewer, source="voice", now=now)
-            (marked if recorded is not None else already).append(med["name"])
+            if recorded is not None:
+                marked.append(med["name"])
+                last_recorded, last_recorded_med = recorded, med
+            else:
+                already.append(med["name"])
         if marked:
-            msg = (
-                f"Marked {marked[0]} as taken."
-                if len(marked) == 1
-                else "Marked your medications: " + ", ".join(marked) + "."
-            )
+            if len(marked) == 1 and last_recorded_med is not None:
+                suffix = self._credited_suffix(last_recorded_med, last_recorded, now)
+                msg = f"Marked {marked[0]} as taken{suffix}."
+            else:
+                msg = "Marked your medications: " + ", ".join(marked) + "."
             if already:
                 verb = "was" if len(already) == 1 else "were"
                 msg += " " + ", ".join(already) + f" {verb} already marked for now."
@@ -545,17 +606,25 @@ class MedicationCommand(IJarvisCommand):
         dose_time = data.get("dose_time")
         push_date = data.get("date")
         if push_date and push_date != now.strftime("%Y-%m-%d"):
-            dose_time = None  # yesterday's push: never tag today's same-named slot
+            # Yesterday's push: never tag today's same-named slot. Logged so the
+            # next incident's forensics can see the degradation happen.
+            _logger.info(
+                "medication stale push tap (date mismatch) — treating as a plain mark",
+                med=med.get("name"), dose_time=dose_time, push_date=push_date,
+                today=now.strftime("%Y-%m-%d"),
+            )
+            dose_time = None
         recorded, _ = self._record_and_broadcast(
             store, med, viewer, source="tap", now=now, dose_time=dose_time
         )
         if recorded is None:
             msg = self._already_recorded_message(store, med, now)
         else:
-            msg = f"Marked {med['name']} as administered."
+            msg = f"Marked {med['name']} as administered{self._credited_suffix(med, recorded, now)}."
         return CommandResponse.final_response(
             context_data={
                 "message": msg, "med_id": med["id"], "recorded": recorded is not None,
+                "dose_time": (recorded or {}).get("dose_time"),
             }
         )
 

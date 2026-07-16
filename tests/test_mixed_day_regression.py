@@ -177,7 +177,8 @@ class TestPreWindowDedup:
     def test_second_early_mark_is_a_duplicate(self, store):
         med = _keppra(store, times=("08:00", "20:00"))
         first = store.log_dose(med, administered_by=ALEX, now=_at(6, 0))
-        assert first is not None and first["dose_time"] is None  # real, untagged
+        # Within 2h of the first slot: tagged to it (edit-safe), not untagged.
+        assert first is not None and first["dose_time"] == "08:00"
         assert store.log_dose(med, administered_by=ALEX, now=_at(6, 5)) is None
 
         covered = store.coverage_for(med, _at(6, 5).date())
@@ -187,24 +188,58 @@ class TestPreWindowDedup:
         )
         assert states["20:00"] == "overdue", "the evening dose is still owed"
 
+    def test_far_early_mark_stays_untagged(self, store):
+        # 03:00 for an 08:00 slot is not attributable to it — record reality,
+        # untagged; coverage still credits the first slot (legacy semantics).
+        med = _keppra(store, times=("08:00", "20:00"))
+        rec = store.log_dose(med, administered_by=ALEX, now=_at(3, 0))
+        assert rec is not None and rec["dose_time"] is None
+        assert store.coverage_for(med, _at(3, 5).date()) == {"08:00"}
+        assert store.log_dose(med, administered_by=ALEX, now=_at(3, 5)) is None
+
+    def test_pre_window_mark_survives_a_slot_removal(self, store):
+        # Review finding: an UNTAGGED 06:00 credit floats onto tonight's slot
+        # if the morning slot is later edited away. Tagged to 08:00, the row
+        # becomes a proximity-bounded orphan instead: tonight stays owed.
+        med = _keppra(store, times=("08:00", "20:00"))
+        store.log_dose(med, administered_by=ALEX, now=_at(6, 0))  # tagged 08:00
+        med["dose_times"] = ["20:00"]  # app edit removes the morning slot
+        store._meds.save(med["id"], med)
+        med = store.get_medication(med["id"], ALEX)
+        assert store.coverage_for(med, _at(12, 0).date()) == set(), (
+            "the 06:00 administration must not cover tonight's 20:00 dose"
+        )
+
 
 class TestStaleButton:
     """Design-review findings B2/B3: a push button is a snapshot. Its slot may
     have been edited away, and the push may be tapped on a later day. Honoring
     the tag verbatim mints orphan credits or covers tomorrow's dose."""
 
-    def test_edited_away_slot_degrades_to_a_normal_mark(self, store):
-        med = _keppra(store, times=("07:30", "19:00"))  # 07:00 was edited away
+    def test_edited_away_slot_records_a_bounded_orphan(self, store):
+        med = _keppra(store, times=("07:30", "19:00"))  # 07:00 was renamed 07:30
         rec = store.log_dose(
             med, administered_by=ALEX, now=_at(7, 40), dose_time="07:00"
         )
-        assert rec is not None and rec["dose_time"] == "07:30", (
-            "a stale tag must resolve like a plain mark, not write an orphan"
-        )
-        # a second tap on the same stale push is now a duplicate
+        # The tag is kept as an orphan; the proximity bound credits the rename.
+        assert rec is not None and rec["dose_time"] == "07:00"
+        assert store.coverage_for(med, _at(7, 45).date()) == {"07:30"}
+        # a second tap on the same stale push is a duplicate (row-level guard)
         assert (
             store.log_dose(med, administered_by=ALEX, now=_at(7, 41), dose_time="07:00")
             is None
+        )
+
+    def test_stale_tap_for_a_removed_slot_cannot_cover_tonight(self, store):
+        # The morning slot was REMOVED (not renamed). A stale tap's orphan row
+        # is proximity-bounded, so it must not credit the 19:00 dose 11h away.
+        med = _keppra(store, times=("19:00",))
+        rec = store.log_dose(
+            med, administered_by=ALEX, now=_at(8, 0), dose_time="07:00"
+        )
+        assert rec is not None and rec["dose_time"] == "07:00"  # recorded reality
+        assert store.coverage_for(med, _at(8, 5).date()) == set(), (
+            "tonight's dose was never given — the orphan must stay inert"
         )
 
     def test_yesterdays_push_does_not_tag_tonights_slot(self, store, cmd):
@@ -324,3 +359,57 @@ class TestOffScheduleReality:
         saturday = datetime(2026, 7, 18, 8, 5).astimezone()
         rec = store.log_dose(med, administered_by=ALEX, now=saturday)
         assert rec is not None and rec["dose_time"] is None
+
+
+class TestReviewFindings:
+    """Pins for the remaining verified adversarial-review findings."""
+
+    def test_duplicate_hint_never_names_a_covered_dose(self, store, cmd):
+        # Early mark credits 08:00; the 06:10 duplicate must point at 20:00
+        # (the next ACTIONABLE dose), not at the already-covered 08:00 —
+        # "next dose is at 8:00 AM" is double-administration bait.
+        med = _keppra(store, times=("08:00", "20:00"))
+        store.log_dose(med, administered_by=ALEX, now=_at(6, 0))
+        msg = cmd._already_recorded_message(store, med, _at(6, 10))
+        assert "8:00 PM" in msg and "8:00 AM" not in msg
+
+    def test_duplicate_button_tap_names_the_still_open_dose(self, store, cmd):
+        # Double-tap on the 19:00 alert while 07:00 is still owed: the reply
+        # must flag the open morning dose rather than imply everything's fine.
+        med = _keppra(store, times=("07:00", "19:00"))
+        store.log_dose(med, administered_by=ALEX, now=_at(19, 5))  # tags 19:00
+        data = {"med_id": med["id"], "dose_time": "19:00", "date": "2026-07-15"}
+        resp = cmd._mark_via_button(data, _req(), _at(19, 6))
+        assert resp.context_data["recorded"] is False
+        assert "7:00 AM" in resp.context_data["message"]
+
+    def test_cascade_mark_names_the_credited_slot(self, store, cmd, inbox):
+        # Repeated marks deliberately heal earlier open slots; the reply must
+        # SAY which slot got credited so an echo can't silently mark a missed
+        # dose without the user noticing.
+        med = _keppra(store, times=("08:00", "14:00", "20:00"))
+        first = store.log_dose(med, administered_by=ALEX, now=_at(20, 5))
+        assert first is not None and first["dose_time"] == "20:00"
+        recorded, _ = cmd._record_and_broadcast(store, med, ALEX, source="voice", now=_at(20, 6))
+        assert recorded is not None and recorded["dose_time"] == "14:00"
+        suffix = cmd._credited_suffix(med, recorded, _at(20, 6))
+        assert "2:00 PM" in suffix
+
+    def test_status_surfaces_unreadable_dose_times(self, store, cmd):
+        med = _keppra(store, times=("19:00",))
+        med["dose_times"] = ["8am", "19:00"]  # hand-edited garbage entry
+        store._meds.save(med["id"], med)
+        resp = cmd.run(_req(), action="status")
+        assert "8am" in resp.context_data["message"], (
+            "an unreadable dose time must be surfaced, not silently dropped"
+        )
+
+    def test_log_dose_uses_one_clock_instant(self, store):
+        # The dedup/slot decision and the stored taken_at must come from the
+        # same instant — two clock reads let a midnight-straddling mark tag
+        # the next day's slot.
+        med = _keppra(store, times=("08:00", "20:00"))
+        stamp = _at(20, 5)
+        rec = store.log_dose(med, administered_by=ALEX, now=stamp)
+        assert rec is not None
+        assert rec["taken_at"] == stamp.astimezone().isoformat()

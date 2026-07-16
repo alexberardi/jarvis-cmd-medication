@@ -25,6 +25,7 @@ from typing import Any
 from jarvis_command_sdk import JarvisStorage
 
 from medication_shared.schedule_util import (
+    ORPHAN_CREDIT_WINDOW_MINUTES,
     VALID_RECURRENCES,
     InvalidScheduleError,
     canon_slot,
@@ -36,6 +37,24 @@ from medication_shared.schedule_util import (
     resolve_slot_for_mark,
     slot_coverage,
 )
+
+try:
+    from jarvis_log_client import JarvisLogger
+except ImportError:  # unit tests / non-node contexts
+    import logging
+
+    class JarvisLogger:  # minimal shim accepting structured kwargs
+        def __init__(self, **kw: Any) -> None:
+            self._log = logging.getLogger(kw.get("service", __name__))
+
+        def info(self, msg: str, **kw: Any) -> None:
+            self._log.info("%s %s", msg, kw or "")
+
+        def warning(self, msg: str, **kw: Any) -> None:
+            self._log.warning("%s %s", msg, kw or "")
+
+
+_logger = JarvisLogger(service="jarvis-node")
 
 MEDS_STORAGE = "medication"
 DOSES_STORAGE = "medication_doses"
@@ -263,26 +282,51 @@ class MedicationStore:
         forward onto a not-yet-taken future dose.
         """
         stamp = (now or datetime.now()).astimezone()
-        med_id = med["id"]
+        med_id = med.get("id") or med.get("_data_key")
+        if not med_id:
+            raise InvalidMedicationError("cannot log a dose for a medication without an id")
         # On a day the recurrence doesn't apply, nothing is scheduled: the mark
         # still records (untagged), exactly like an as-needed med.
         active = recurrence_applies(med.get("recurrence", "daily"), stamp.date())
         times = coerce_dose_times(med.get("dose_times")) if active else []
+        slots_today = canon_slots(times)
 
-        with _med_lock(med_id):
-            covered = slot_coverage(times, self.doses_on(med_id, stamp.date()))
+        with _med_lock(str(med_id)):
+            rows = self.doses_on(str(med_id), stamp.date())
+            covered = slot_coverage(times, rows)
             eligible = eligible_slots(times, stamp)
 
             slot = canon_slot(dose_time) if dose_time is not None else None
-            if slot is not None and (slot not in canon_slots(times) or slot not in eligible):
-                # Stale button: the slot was edited off the schedule, or its
-                # window hasn't opened today (yesterday's push tapped after
-                # midnight). Tagging it verbatim would cover the wrong dose.
-                slot = None
-            if slot is not None:
-                if slot in covered:
+            untargeted = slot is None
+            if slot is not None and slot not in slots_today:
+                # The push's slot was edited off the schedule. Keep the tag as
+                # an ORPHAN row: slot_coverage credits it only within the 2h
+                # proximity bound, so a rename heals and a removed slot's dose
+                # can't leak onto tonight's. (Degrading to untagged would give
+                # the row an UNBOUNDED credit — the leak, one step removed.)
+                if any(canon_slot(r.get("dose_time")) == slot for r in rows):
+                    _logger.info(
+                        "medication mark ignored (stale slot already recorded)",
+                        med=med.get("name"), dose_time=slot, source=source,
+                    )
                     return None
-            else:
+                _logger.info(
+                    "medication mark: slot no longer scheduled — recording as orphan",
+                    med=med.get("name"), dose_time=slot, source=source,
+                )
+            elif slot is not None and slot not in eligible:
+                # In the schedule but its window hasn't opened today: this is
+                # yesterday's push tapped after midnight. Tagging it verbatim
+                # would cover TONIGHT's dose — degrade to an untargeted mark.
+                _logger.info(
+                    "medication mark: stale dose_time discarded (window not open today)",
+                    med=med.get("name"), dose_time=slot, source=source,
+                )
+                slot, untargeted = None, True
+            elif slot is not None and slot in covered:
+                return None
+
+            if untargeted:
                 slot = resolve_slot_for_mark(times, stamp, covered)
                 if slot is None:
                     if eligible:
@@ -290,15 +334,20 @@ class MedicationStore:
                         return None
                     # Nothing markable yet today (before the first window, an
                     # off-recurrence day, or an as-needed med): a real
-                    # administration, recorded untagged — slot_coverage credits
-                    # it to the next slot. At most one such credit can be
-                    # outstanding: a second early mark is a duplicate.
-                    upcoming = canon_slots(times)
-                    if upcoming and upcoming[0] in covered:
+                    # administration. At most one may be outstanding — a second
+                    # early mark is a duplicate, the v0.2.0 double-confirm bug.
+                    if slots_today and slots_today[0] in covered:
                         return None
+                    # Tag it to the imminent first slot when it's close (an
+                    # early dose, edit-safe via the orphan bound); otherwise
+                    # record untagged and let coverage credit it.
+                    if slots_today and slots_today[0] in eligible_slots(
+                        times, stamp, early_minutes=ORPHAN_CREDIT_WINDOW_MINUTES
+                    ):
+                        slot = slots_today[0]
 
-            taken_at = _iso(now)
-            key = f"dose-{med_id}-{taken_at}"
+            taken_at = stamp.isoformat()
+            key = f"dose-{med_id}-{taken_at}-{uuid.uuid4().hex[:8]}"
             record = {
                 "med_id": med_id,
                 "med_name": med.get("name"),
