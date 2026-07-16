@@ -36,7 +36,9 @@ from jarvis_command_sdk import (
 from medication_shared.med_store import VALID_SCOPES, MedicationStore, record_owner
 from medication_shared.schedule_util import (
     VALID_RECURRENCES,
+    canon_slots,
     coerce_dose_times,
+    next_due,
     recurrence_applies,
 )
 
@@ -331,16 +333,8 @@ class MedicationCommand(IJarvisCommand):
         for med in meds:
             if not recurrence_applies(med.get("recurrence", "daily"), now.date()):
                 continue
-            scheduled = list(med.get("dose_times") or [])
-            covered = store.covered_slots(med["id"], now.date())
-            if covered:
-                # Slot-tagged: what's left is what wasn't actually administered.
-                # (Slicing by a count marked the evening dose as taken whenever
-                # the morning one was confirmed twice.)
-                remaining = [t for t in scheduled if t not in covered]
-            else:
-                taken = len(store.doses_on(med["id"], now.date()))
-                remaining = scheduled[taken:]  # legacy untagged rows
+            covered = store.coverage_for(med, now.date())
+            remaining = [t for t in canon_slots(med.get("dose_times")) if t not in covered]
             if remaining:
                 pending.append((med, remaining))
 
@@ -412,17 +406,48 @@ class MedicationCommand(IJarvisCommand):
             scope=med.get("scope"), viewer=viewer,
         )
         administered_by = request_info.user_id if request_info is not None else None
-        broadcast = self._record_and_broadcast(store, med, administered_by, source="voice")
-        if med.get("scope") == "household" and broadcast:
+        recorded, broadcast = self._record_and_broadcast(store, med, administered_by, source="voice")
+        if recorded is None:
+            msg = self._already_recorded_message(store, med)
+        elif med.get("scope") == "household" and broadcast:
             msg = f"Marked {med['name']} as given, and let the household know."
         else:
             msg = f"Marked {med['name']} as taken."
         return CommandResponse.success_response(
-            context_data={"message": msg, "med_id": med["id"], "name": med["name"]},
+            context_data={
+                "message": msg, "med_id": med["id"], "name": med["name"],
+                "recorded": recorded is not None,
+            },
             wait_for_input=False,
         )
 
-    def _run_mark_mine(self, store: MedicationStore, viewer: int | None) -> CommandResponse:
+    def _already_recorded_message(
+        self, store: MedicationStore, med: dict, now: datetime | None = None
+    ) -> str:
+        """Honest reply for a mark that recorded nothing (duplicate).
+
+        Never claim success here: a swallowed mark that reads "Marked as taken"
+        is how the 2026-07-15 lockout stayed invisible — the user re-marked for
+        two hours while nothing was being written. Saying "already marked" is
+        also the right safety answer if this was a genuine second administration.
+        """
+        now = (now or datetime.now()).astimezone()
+        name = med.get("name") or "that medication"
+        slots = canon_slots(med.get("dose_times"))
+        covered = store.coverage_for(med, now.date())
+        if slots and all(t in covered for t in slots):
+            return f"{name} is already marked as done for today."
+        nxt = next_due(slots, now, recurrence=med.get("recurrence", "daily"))
+        if nxt is not None:
+            return (
+                f"{name} is already marked for now — nothing new recorded. "
+                f"The next dose is at {_spoken_time(nxt)}."
+            )
+        return f"{name} is already marked for now — nothing new recorded."
+
+    def _run_mark_mine(
+        self, store: MedicationStore, viewer: int | None, now: datetime | None = None
+    ) -> CommandResponse:
         """Mark the recognized speaker's pending personal meds ("I took my meds").
 
         Scoped to the speaker's OWN meds (household meds like the dog's are not
@@ -437,7 +462,7 @@ class MedicationCommand(IJarvisCommand):
             return CommandResponse.error_response(
                 error_details=msg, context_data={"message": msg, "error": "unknown_speaker"}
             )
-        now = datetime.now().astimezone()
+        now = (now or datetime.now()).astimezone()
         mine = [m for m in store.list_medications(viewer) if record_owner(m) == viewer]
         if not mine:
             msg = "You don't have any personal medications set up. You can add them in the app."
@@ -446,42 +471,69 @@ class MedicationCommand(IJarvisCommand):
             )
         pending = [m for m in mine if self._has_pending_dose(store, m, now)]
         if not pending:
-            msg = "You've already taken all your medications for today."
+            if any(canon_slots(m.get("dose_times")) for m in mine):
+                msg = "You've already taken all your medications for today."
+            else:
+                msg = "None of your medications have doses scheduled today."
             return CommandResponse.success_response(
                 context_data={"message": msg, "marked": []}, wait_for_input=False
             )
+        # Report only what actually recorded. A med can be "pending" (an
+        # upcoming slot is uncovered) while nothing is markable right now —
+        # log_dose returns None for those, and claiming "Marked as taken"
+        # for them is the false-success bug this fix removes.
         marked: list[str] = []
+        already: list[str] = []
         for med in pending:
-            self._record_and_broadcast(store, med, viewer, source="voice", now=now)
-            marked.append(med["name"])
-        msg = (
-            f"Marked {marked[0]} as taken."
-            if len(marked) == 1
-            else "Marked your medications: " + ", ".join(marked) + "."
-        )
-        _logger.info("medication marked mine", viewer=viewer, marked=marked)
+            recorded, _ = self._record_and_broadcast(store, med, viewer, source="voice", now=now)
+            (marked if recorded is not None else already).append(med["name"])
+        if marked:
+            msg = (
+                f"Marked {marked[0]} as taken."
+                if len(marked) == 1
+                else "Marked your medications: " + ", ".join(marked) + "."
+            )
+            if already:
+                verb = "was" if len(already) == 1 else "were"
+                msg += " " + ", ".join(already) + f" {verb} already marked for now."
+        elif len(pending) == 1:
+            msg = self._already_recorded_message(store, pending[0], now)
+        else:
+            msg = "Your medications are already marked for now — nothing new recorded."
+        _logger.info("medication marked mine", viewer=viewer, marked=marked, already=already)
         return CommandResponse.success_response(
-            context_data={"message": msg, "marked": marked}, wait_for_input=False
+            context_data={"message": msg, "marked": marked, "already_recorded": already},
+            wait_for_input=False,
         )
 
     def _has_pending_dose(self, store: MedicationStore, med: dict, now: datetime) -> bool:
         """True if the med still has an unmarked dose scheduled for today."""
         if not recurrence_applies(med.get("recurrence", "daily"), now.date()):
             return False
-        med_id = med.get("id") or med.get("_data_key")
-        if not med_id:
+        if not (med.get("id") or med.get("_data_key")):
             return True
-        slots = coerce_dose_times(med.get("dose_times"))
-        covered = store.covered_slots(med_id, now.date())
-        if covered:
-            return any(t not in covered for t in slots)
-        # Legacy untagged rows: fall back to counting.
-        return len(store.doses_on(med_id, now.date())) < len(slots)
+        covered = store.coverage_for(med, now.date())
+        return any(t not in covered for t in canon_slots(med.get("dose_times")))
 
     @callback("mark_administered")
     def mark_administered(self, data: dict, request_info: RequestInformation) -> CommandResponse:
-        """Tap handler for the 'Mark administered' button on a reminder push."""
-        med_id = (data or {}).get("med_id")
+        """Tap handler for the 'Mark administered' button on a reminder push.
+
+        The push carries the slot it alerted for (``dose_time``) and the local
+        date it was computed for (``date``), so the tap covers exactly the dose
+        the alert named. A tap on a stale push — a different day, or a slot
+        edited off the schedule — degrades to a plain untargeted mark rather
+        than tagging the wrong day's dose.
+        """
+        return self._mark_via_button(data or {}, request_info, datetime.now().astimezone())
+
+    def _mark_via_button(
+        self, data: dict, request_info: RequestInformation, now: datetime
+    ) -> CommandResponse:
+        # Callback body with an injectable clock — callbacks have a fixed
+        # (data, request_info) signature, and the stale-push date checks
+        # can't be tested against wall-clock time.
+        med_id = data.get("med_id")
         viewer = request_info.user_id if request_info is not None else None
         store = MedicationStore()
         med = store.get_medication(med_id, viewer) if med_id else None
@@ -490,9 +542,21 @@ class MedicationCommand(IJarvisCommand):
                 error_details="That medication is no longer available.",
                 context_data={"message": "That medication is no longer available."},
             )
-        self._record_and_broadcast(store, med, viewer, source="tap")
+        dose_time = data.get("dose_time")
+        push_date = data.get("date")
+        if push_date and push_date != now.strftime("%Y-%m-%d"):
+            dose_time = None  # yesterday's push: never tag today's same-named slot
+        recorded, _ = self._record_and_broadcast(
+            store, med, viewer, source="tap", now=now, dose_time=dose_time
+        )
+        if recorded is None:
+            msg = self._already_recorded_message(store, med, now)
+        else:
+            msg = f"Marked {med['name']} as administered."
         return CommandResponse.final_response(
-            context_data={"message": f"Marked {med['name']} as administered.", "med_id": med["id"]}
+            context_data={
+                "message": msg, "med_id": med["id"], "recorded": recorded is not None,
+            }
         )
 
     # ── Shared mark + broadcast ───────────────────────────────────────────
@@ -505,16 +569,19 @@ class MedicationCommand(IJarvisCommand):
         *,
         source: str,
         now: datetime | None = None,
-    ) -> bool:
+        dose_time: str | None = None,
+    ) -> tuple[dict | None, bool]:
         """Log the dose; for a household med, broadcast it so nobody double-doses.
 
-        Returns True if a household broadcast was posted successfully.
+        Returns ``(recorded_row_or_None, household_broadcast_ok)``. Callers must
+        check the first element — a ``None`` row means nothing was written and
+        the user must be told so, not congratulated.
         """
         recorded = store.log_dose(
-            med, administered_by=administered_by, source=source, now=now
+            med, administered_by=administered_by, source=source, now=now, dose_time=dose_time
         )
         if recorded is None:
-            # Every slot for today is already covered — this is a duplicate
+            # Everything markable right now is already covered — a duplicate
             # confirmation (double-tap, or a tap plus a spoken "I took it").
             # Don't log it and don't broadcast: a second "administered" push is
             # how a household member gets told twice, and the extra row is what
@@ -524,10 +591,10 @@ class MedicationCommand(IJarvisCommand):
                 med=med.get("name"),
                 source=source,
             )
-            return False
+            return None, False
         if med.get("scope") != "household":
             _logger.info("medication marked (personal — no broadcast)", med=med.get("name"), source=source)
-            return False
+            return recorded, False
         when = _spoken_time((now or datetime.now()).astimezone())
         dose = med.get("dose")
         detail = f"{med['name']} ({dose})" if dose else med["name"]
@@ -540,4 +607,4 @@ class MedicationCommand(IJarvisCommand):
             target_type="household",
         )
         _logger.info("medication household broadcast", med=med.get("name"), source=source, post_tag=tag)
-        return tag == "ok"
+        return recorded, tag == "ok"

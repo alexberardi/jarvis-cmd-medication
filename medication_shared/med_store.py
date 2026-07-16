@@ -17,6 +17,7 @@ unresolved speaker must never silently produce a household-visible "personal" me
 
 from __future__ import annotations
 
+import threading
 import uuid
 from datetime import date, datetime
 from typing import Any
@@ -26,10 +27,14 @@ from jarvis_command_sdk import JarvisStorage
 from medication_shared.schedule_util import (
     VALID_RECURRENCES,
     InvalidScheduleError,
+    canon_slot,
+    canon_slots,
     coerce_dose_times,
+    eligible_slots,
     parse_hhmm,
-    due_slot,
+    recurrence_applies,
     resolve_slot_for_mark,
+    slot_coverage,
 )
 
 MEDS_STORAGE = "medication"
@@ -72,10 +77,21 @@ def visible_to(record: dict, viewer_user_id: int | None) -> bool:
 
 
 def _normalized(record: dict) -> dict:
-    """Coerce ``dose_times`` to a clean list (the app's array-as-text edit can
-    round-trip it back as a comma-separated string)."""
+    """Coerce ``dose_times`` to a clean, zero-padded list.
+
+    The app's array-as-text edit can round-trip ``["07:00"]`` back as the string
+    ``"7:00, 19:00"`` — and the edit path saves the record without going through
+    ``add_medication``'s validation, so unpadded times reach storage. All slot
+    comparisons canonicalize independently (``canon_slot``), so this is
+    hardening, not the load-bearing fix; an entry that won't parse is kept as-is
+    rather than making the med unreadable.
+    """
     if "dose_times" in record:
-        record["dose_times"] = coerce_dose_times(record.get("dose_times"))
+        cleaned: list[str] = []
+        for raw in coerce_dose_times(record.get("dose_times")):
+            slot = canon_slot(raw)
+            cleaned.append(slot if slot is not None else raw)
+        record["dose_times"] = sorted(set(cleaned))
     return record
 
 
@@ -84,6 +100,20 @@ def _iso(now: datetime | None) -> str:
     # and the agent query it (both use the local date). Defaulting to UTC here
     # mislabels evening doses with tomorrow's date once UTC rolls past midnight.
     return (now or datetime.now().astimezone()).isoformat()
+
+
+# log_dose is read-coverage-then-write; a voice mark and a push-button callback
+# for the same med can interleave in the node process (agent thread + MQTT
+# listener). Serialize per med so both can't pass the duplicate guard and
+# double-record. Process-local is sufficient: all writers live in the node's
+# main process.
+_LOCKS_GUARD = threading.Lock()
+_MED_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _med_lock(med_id: str) -> threading.Lock:
+    with _LOCKS_GUARD:
+        return _MED_LOCKS.setdefault(str(med_id), threading.Lock())
 
 
 def _clean_dose_times(dose_times: Any) -> list[str]:
@@ -208,61 +238,91 @@ class MedicationStore:
         administered_by: int | None,
         source: str = "voice",
         now: datetime | None = None,
+        dose_time: str | None = None,
     ) -> dict | None:
-        """Record that a dose of ``med`` was administered, tagged with the slot it
-        covers. Mirrors the med's ``user_id`` onto the log row so the browser
+        """Record that a dose of ``med`` was administered, tagged with the slot
+        it covers. Mirrors the med's ``user_id`` onto the log row so the browser
         filter treats it identically.
 
-        Returns ``None`` when that slot is ALREADY covered today — i.e. this is a
-        duplicate confirmation (a double-tap, or a tap plus a voice "I took it").
+        Returns ``None`` — no row, and callers must say so honestly — when the
+        mark is a duplicate: everything markable right now is already covered.
+        Duplicate marks are not hypothetical (double-taps and voice+tap pairs
+        seconds apart are in the prod dose log), and an uncaught duplicate is
+        how a later dose used to be silently rendered "done".
 
-        The guard is load-bearing. Administrations used to be untagged and merely
-        counted, so a second mark of the morning dose pushed the count to 2 and
-        the evening slot was rendered "done" — silently, with no reminder and no
-        error. Duplicate marks are not hypothetical: two "administered" pushes
-        2.5 minutes apart were observed in production, and a double-tap whose
-        second confirmation was swallowed by the notification dedup window.
+        ``dose_time`` is the slot a reminder push's Mark button was fired for.
+        It is honored only when it is a current slot whose window has opened
+        today — a stale push (schedule edited, or tapped after midnight) falls
+        back to behaving like a plain voice mark, because writing its tag
+        verbatim would cover a different day's (or nobody's) dose.
+
+        The dedup guard resolves against :func:`slot_coverage` — the same
+        coverage the reminder agent alerts on. v0.2.1 keyed this guard on the
+        latest open slot regardless of coverage, which both swallowed marks the
+        agent was actively demanding (the 2026-07-15 lockout) and reached
+        forward onto a not-yet-taken future dose.
         """
         stamp = (now or datetime.now()).astimezone()
-        times = coerce_dose_times(med.get("dose_times"))
-        covered = self.covered_slots(med["id"], stamp.date())
+        med_id = med["id"]
+        # On a day the recurrence doesn't apply, nothing is scheduled: the mark
+        # still records (untagged), exactly like an as-needed med.
+        active = recurrence_applies(med.get("recurrence", "daily"), stamp.date())
+        times = coerce_dose_times(med.get("dose_times")) if active else []
 
-        slot = due_slot(times, stamp)
-        if slot is not None and slot in covered:
-            # A dose IS due, and it's already been marked — this is a duplicate
-            # confirmation (double-tap, or a tap plus a spoken "I took it").
-            return None
-        # slot is None => nothing is scheduled around now. That's still a real
-        # administration and must be recorded, but it credits no slot: silently
-        # dropping it would be the same class of bug from the other direction.
+        with _med_lock(med_id):
+            covered = slot_coverage(times, self.doses_on(med_id, stamp.date()))
+            eligible = eligible_slots(times, stamp)
 
-        taken_at = _iso(now)
-        key = f"dose-{med['id']}-{taken_at}"
-        record = {
-            "med_id": med["id"],
-            "med_name": med.get("name"),
-            "administered_by": None if administered_by is None else int(administered_by),
-            "taken_at": taken_at,
-            "dose_time": slot,
-            "source": source,
-            "scope": med.get("scope"),
-            "user_id": med.get("user_id"),
-        }
-        self._doses.save(key, record)
-        return record
+            slot = canon_slot(dose_time) if dose_time is not None else None
+            if slot is not None and (slot not in canon_slots(times) or slot not in eligible):
+                # Stale button: the slot was edited off the schedule, or its
+                # window hasn't opened today (yesterday's push tapped after
+                # midnight). Tagging it verbatim would cover the wrong dose.
+                slot = None
+            if slot is not None:
+                if slot in covered:
+                    return None
+            else:
+                slot = resolve_slot_for_mark(times, stamp, covered)
+                if slot is None:
+                    if eligible:
+                        # Everything markable right now is already covered.
+                        return None
+                    # Nothing markable yet today (before the first window, an
+                    # off-recurrence day, or an as-needed med): a real
+                    # administration, recorded untagged — slot_coverage credits
+                    # it to the next slot. At most one such credit can be
+                    # outstanding: a second early mark is a duplicate.
+                    upcoming = canon_slots(times)
+                    if upcoming and upcoming[0] in covered:
+                        return None
 
-    def covered_slots(self, med_id: str, day: date) -> set[str]:
-        """Dose slots actually administered on ``day``.
+            taken_at = _iso(now)
+            key = f"dose-{med_id}-{taken_at}"
+            record = {
+                "med_id": med_id,
+                "med_name": med.get("name"),
+                "administered_by": None if administered_by is None else int(administered_by),
+                "taken_at": taken_at,
+                "dose_time": slot,
+                "source": source,
+                "scope": med.get("scope"),
+                "user_id": med.get("user_id"),
+            }
+            self._doses.save(key, record)
+            return record
 
-        Only slot-tagged rows count. Legacy rows (written before tagging) have no
-        ``dose_time``; callers fall back to counting for those so existing installs
-        don't suddenly resurrect old doses as overdue.
+    def coverage_for(self, med: dict, day: date, *, med_id: str | None = None) -> set[str]:
+        """Slots covered on ``day`` per :func:`slot_coverage` over the med's rows.
+
+        The one coverage view shared by the agent, the status query, the
+        pending check, and (via ``log_dose``) the duplicate guard.
         """
-        return {
-            rec["dose_time"]
-            for rec in self.doses_on(med_id, day)
-            if rec.get("dose_time")
-        }
+        mid = med_id or med.get("id") or med.get("_data_key")
+        if not mid:
+            return set()
+        times = coerce_dose_times(med.get("dose_times"))
+        return slot_coverage(times, self.doses_on(str(mid), day))
 
     def doses_on(self, med_id: str, day: date) -> list[dict]:
         """All administration records for ``med_id`` on ``day`` (local to taken_at)."""

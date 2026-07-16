@@ -17,6 +17,7 @@ from medication_shared.schedule_util import (
     next_due,
     parse_hhmm,
     recurrence_applies,
+    slot_coverage,
 )
 
 WED = date(2026, 6, 24)
@@ -126,15 +127,21 @@ class TestCoerceDoseTimes:
         assert coerce_dose_times([]) == []
 
     def test_dose_states_accepts_a_string(self):
-        states = dose_states("08:00,20:00", datetime(2026, 6, 24, 8, 10), 0)
+        states = dose_states("08:00,20:00", datetime(2026, 6, 24, 8, 10), set())
         assert [(t, s) for t, s, _dt in states] == [("08:00", "due"), ("20:00", "upcoming")]
+
+
+def untagged(n: int = 1) -> list[dict]:
+    """n administration rows with no slot tag (legacy / pre-first-window)."""
+    return [{"dose_time": None} for _ in range(n)]
 
 
 class TestDoseStates:
     TIMES = ["08:00", "20:00"]
 
-    def _states(self, now, taken=0, **kw):
-        return [(t, s) for t, s, _dt in dose_states(self.TIMES, now, taken, **kw)]
+    def _states(self, now, rows=(), **kw):
+        covered = slot_coverage(self.TIMES, list(rows))
+        return [(t, s) for t, s, _dt in dose_states(self.TIMES, now, covered, **kw)]
 
     def test_all_upcoming_before_first(self):
         assert self._states(datetime(2026, 6, 24, 7, 0)) == [("08:00", "upcoming"), ("20:00", "upcoming")]
@@ -147,16 +154,20 @@ class TestDoseStates:
         # 08:45 > 08:00 + 30min grace -> "overdue"
         assert self._states(datetime(2026, 6, 24, 8, 45)) == [("08:00", "overdue"), ("20:00", "upcoming")]
 
-    def test_taken_dose_marks_earliest_slot_done(self):
-        # one dose taken today -> the 08:00 slot is done even though it's late
-        assert self._states(datetime(2026, 6, 24, 21, 0), taken=1) == [("08:00", "done"), ("20:00", "overdue")]
+    def test_untagged_row_marks_earliest_slot_done(self):
+        # one untagged administration today -> credits the 08:00 slot even late
+        assert self._states(datetime(2026, 6, 24, 21, 0), rows=untagged(1)) == [
+            ("08:00", "done"), ("20:00", "overdue"),
+        ]
 
     def test_all_done_when_all_taken(self):
-        assert self._states(datetime(2026, 6, 24, 21, 0), taken=2) == [("08:00", "done"), ("20:00", "done")]
+        assert self._states(datetime(2026, 6, 24, 21, 0), rows=untagged(2)) == [
+            ("08:00", "done"), ("20:00", "done"),
+        ]
 
     def test_recurrence_gates_the_day(self):
         sat = datetime(2026, 6, 27, 9, 0)  # Saturday
-        assert dose_states(self.TIMES, sat, 0, recurrence="weekdays") == []
+        assert dose_states(self.TIMES, sat, set(), recurrence="weekdays") == []
         assert self._states(sat, recurrence="weekends") == [("08:00", "overdue"), ("20:00", "upcoming")]
 
     def test_custom_grace(self):

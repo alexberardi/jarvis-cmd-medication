@@ -5,7 +5,7 @@ Polls every 5 minutes. For each active medication, per dose slot today
 
 - ``due``     — at the dose time, within a 30-min grace → a reminder, fired once.
 - ``overdue`` — grace passed and still unmarked → an escalating warning, re-fired
-                at most hourly until the dose is marked or the next dose is due.
+                at most hourly until the dose is marked or the local day ends.
 
 Each fire is pushed to the right audience (household med → everyone; personal
 med → the owner) with a "Mark administered" button. Household meds are ALSO
@@ -126,18 +126,15 @@ class MedicationReminderAgent(IJarvisAgent):
         if not med_id:
             return
         name = med.get("name") or "your medication"
-        # Pass the slots ACTUALLY administered, not a count. Counting made a
-        # second confirmation of the morning dose mark the evening one "done" —
-        # so the evening reminder silently never fired. covered_slots is empty for
-        # legacy untagged rows, which is why the count is still passed as the
-        # fallback.
-        taken_today = len(store.doses_on(med_id, now.date()))
-        covered = store.covered_slots(med_id, now.date()) or None
+        # slot_coverage is the SAME function log_dose's duplicate guard resolves
+        # against. The agent and the mark path disagreeing on what is owed is
+        # the 2026-07-15 incident: this agent demanded the 07:00 slot all
+        # evening while log_dose refused every mark that would have covered it.
+        covered = store.coverage_for(med, now.date(), med_id=med_id)
         states = dose_states(
             med.get("dose_times") or [],
             now,
-            taken_today,
-            covered_slots=covered,
+            covered,
             recurrence=med.get("recurrence", "daily"),
             grace_minutes=GRACE_MINUTES,
         )
@@ -184,12 +181,21 @@ class MedicationReminderAgent(IJarvisAgent):
                 )
             )
         # Push with a "Mark administered" button, scoped to the right audience.
+        # The payload names the exact dose this alert is about — slot AND local
+        # date — so a tap covers precisely what the alert demanded. Without the
+        # slot, a tap resolves like a generic mark and can be judged a duplicate
+        # of a later, already-covered dose; without the date, yesterday's push
+        # tapped after midnight would tag TONIGHT's same-named slot as done.
         element = {
             "id": f"mark-{med.get('id')}-{dose_time}",
             "label": "Mark administered",
             "command": "medication",
             "callback": "mark_administered",
-            "data": {"med_id": med.get("id")},
+            "data": {
+                "med_id": med.get("id"),
+                "dose_time": dose_time,
+                "date": now.strftime("%Y-%m-%d"),
+            },
             "navigation_type": "stack",
         }
         tag = JarvisInbox("medication").post(
