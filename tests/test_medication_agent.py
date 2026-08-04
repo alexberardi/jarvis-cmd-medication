@@ -134,3 +134,43 @@ class TestSpokenPrivacy:
         )
         agent._tick(_now(8, 10))  # Wednesday
         assert inbox.posts == []
+
+
+class TestRestartPersistence:
+    """Fired-state must survive a process restart. The node restarts routinely
+    (daily maintenance window, RSS watchdog) — with in-memory-only dedup, every
+    restart inside the 30-min grace window re-fired the same dose reminder
+    (2026-08-03 incident: six 'Time for Leo Keppra' cues in eight minutes)."""
+
+    def test_due_reminder_not_refired_after_restart(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        agent._tick(_now(8, 10))
+        assert len(inbox.posts) == 1
+        restarted = MedicationReminderAgent()  # same backend = same node DB
+        restarted._tick(_now(8, 20))  # still inside the grace window
+        assert len(inbox.posts) == 1
+
+    def test_overdue_cadence_survives_restart(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        agent._tick(_now(8, 45))  # overdue -> first warning
+        assert len(inbox.posts) == 1
+        restarted = MedicationReminderAgent()
+        restarted._tick(_now(9, 30))  # < 1h since warn -> quiet
+        assert len(inbox.posts) == 1
+        restarted._tick(_now(9, 50))  # > 1h -> re-warn as normal
+        assert len(inbox.posts) == 2
+
+    def test_restart_on_a_new_day_re_arms(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        agent._tick(_now(8, 10))
+        assert len(inbox.posts) == 1
+        restarted = MedicationReminderAgent()
+        restarted._tick(_now(8, 10, day=25))  # next day's dose fires cleanly
+        assert len(inbox.posts) == 2
+
+    def test_restart_does_not_suppress_a_never_fired_reminder(self, store, agent, inbox):
+        _household(store, times=("08:00",))
+        agent._tick(_now(7, 0))  # before the window: nothing fired, state saved or not
+        restarted = MedicationReminderAgent()
+        restarted._tick(_now(8, 10))
+        assert len(inbox.posts) == 1

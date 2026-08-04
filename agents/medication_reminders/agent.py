@@ -53,6 +53,7 @@ from jarvis_command_sdk import (
     IJarvisAgent,
     IJarvisSecret,
     JarvisInbox,
+    JarvisStorage,
 )
 
 from medication_shared.med_store import MedicationStore, record_owner
@@ -65,6 +66,14 @@ GRACE_MINUTES = 30
 REWARN_MINUTES = 60
 ALERT_TTL_MINUTES = 15
 
+# Fired-state lives in node storage, not just memory: the node process restarts
+# routinely (daily maintenance window, RSS watchdog), and with in-memory-only
+# dedup every restart inside the 30-min grace window re-fired the same dose
+# reminder (2026-08-03: six "Time for Leo Keppra" cues in eight minutes while
+# the watchdog crash-looped). One record, overwritten with today's keys only.
+STATE_STORAGE = "medication_reminder_state"
+STATE_KEY = "fired"
+
 
 class MedicationReminderAgent(IJarvisAgent):
     """Fires dose-time reminders and overdue warnings for active medications."""
@@ -75,6 +84,9 @@ class MedicationReminderAgent(IJarvisAgent):
         self._reminded: set[str] = set()
         # overdue warnings: last-warned time per (med, slot, date) for hourly cadence
         self._overdue_warned: Dict[str, datetime] = {}
+        # restored from node storage on the first tick, not here: the storage
+        # backend may not be wired yet when agents are constructed at discovery
+        self._state_loaded = False
 
     @property
     def name(self) -> str:
@@ -108,6 +120,7 @@ class MedicationReminderAgent(IJarvisAgent):
     # Sync core so it's deterministically testable (run() just supplies "now").
     def _tick(self, now: datetime) -> None:
         self._alerts = []
+        self._load_state(now)
         self._prune(now)
         try:
             store = MedicationStore()
@@ -153,6 +166,10 @@ class MedicationReminderAgent(IJarvisAgent):
                 if slot_key in self._reminded:
                     continue
                 self._reminded.add(slot_key)
+                # Persist BEFORE the cue: a crash between fire and save is how
+                # a restart re-fires. The reverse failure (saved but the fire
+                # errored) degrades to the overdue warning catching it later.
+                self._save_state()
                 self._fire(
                     med, dose_time, now,
                     title=f"Time for {name}",
@@ -163,6 +180,7 @@ class MedicationReminderAgent(IJarvisAgent):
                 if last is not None and (now - last) < timedelta(minutes=REWARN_MINUTES):
                     continue
                 self._overdue_warned[slot_key] = now
+                self._save_state()
                 self._fire(
                     med, dose_time, now,
                     title=f"{name} overdue",
@@ -226,3 +244,37 @@ class MedicationReminderAgent(IJarvisAgent):
         today = now.strftime("%Y-%m-%d")
         self._reminded = {k for k in self._reminded if k.endswith(today)}
         self._overdue_warned = {k: v for k, v in self._overdue_warned.items() if k.endswith(today)}
+
+    def _load_state(self, now: datetime) -> None:
+        """Restore today's fired-state from node storage (once per process)."""
+        if self._state_loaded:
+            return
+        self._state_loaded = True
+        try:
+            rec = JarvisStorage(STATE_STORAGE).get(STATE_KEY)
+        except Exception as exc:  # a broken read must not stop reminders
+            logger.warning("medication agent: fired-state load failed", error=str(exc))
+            return
+        if not rec:
+            return
+        today = now.strftime("%Y-%m-%d")
+        self._reminded = {k for k in rec.get("reminded", []) if k.endswith(today)}
+        for key, stamp in (rec.get("overdue_warned") or {}).items():
+            if not key.endswith(today):
+                continue
+            try:
+                self._overdue_warned[key] = datetime.fromisoformat(stamp)
+            except (TypeError, ValueError):
+                continue  # an unreadable stamp just re-warns once early
+
+    def _save_state(self) -> None:
+        try:
+            JarvisStorage(STATE_STORAGE).save(
+                STATE_KEY,
+                {
+                    "reminded": sorted(self._reminded),
+                    "overdue_warned": {k: v.isoformat() for k, v in self._overdue_warned.items()},
+                },
+            )
+        except Exception as exc:  # a broken write must not stop the cue itself
+            logger.warning("medication agent: fired-state save failed", error=str(exc))
