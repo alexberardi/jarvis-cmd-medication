@@ -315,8 +315,11 @@ class MedicationCommand(IJarvisCommand):
             wait_for_input=False,
         )
 
-    def _run_status(self, store: MedicationStore, viewer: int | None, name: str | None) -> CommandResponse:
-        now = datetime.now().astimezone()
+    def _run_status(
+        self, store: MedicationStore, viewer: int | None, name: str | None,
+        now: datetime | None = None,
+    ) -> CommandResponse:
+        now = (now or datetime.now()).astimezone()
         meds = store.list_medications(viewer)
         if name:
             meds = _match_by_name(meds, name)

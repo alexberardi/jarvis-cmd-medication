@@ -173,17 +173,21 @@ class TestStatus:
         assert len(pending) == 1
         assert pending[0]["remaining"] == ["07:00", "19:00"]  # nothing taken yet
 
+    # A fixed local morning: a dose logged "now" must cover the 07:00 slot,
+    # whatever the wall clock says when the suite runs.
+    FIXED = datetime(2026, 6, 24, 8, 0).astimezone()
+
     def test_status_reflects_taken_doses(self, store, cmd):
         med = _household(store, name="Dog", times=("07:00", "19:00"))
-        store.log_dose(med, administered_by=ALICE, now=datetime.now().astimezone())
-        resp = cmd.run(_req(ALICE), action="status")
+        store.log_dose(med, administered_by=ALICE, now=self.FIXED)
+        resp = cmd._run_status(store, ALICE, None, now=self.FIXED)
         pending = resp.context_data["pending"]
         assert pending[0]["remaining"] == ["19:00"]  # first dose accounted for
 
     def test_status_all_caught_up(self, store, cmd):
         med = _household(store, name="Dog", times=("07:00",))
-        store.log_dose(med, administered_by=ALICE, now=datetime.now().astimezone())
-        resp = cmd.run(_req(ALICE), action="status")
+        store.log_dose(med, administered_by=ALICE, now=self.FIXED)
+        resp = cmd._run_status(store, ALICE, None, now=self.FIXED)
         assert resp.context_data["pending"] == []
         assert "caught up" in resp.context_data["message"].lower()
 
